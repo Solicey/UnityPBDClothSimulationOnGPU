@@ -1,0 +1,69 @@
+#pragma kernel NormalCompute
+
+StructuredBuffer<float4> Positions;
+RWStructuredBuffer<float4> Normals;
+
+uint colVertexCount;
+uint rowVertexCount;
+
+inline float3 safeNormalize(float3 vec)
+{
+    float mag2 = max(0.001f, dot(vec, vec));
+    return vec * rsqrt(mag2);
+}
+
+[numthreads(8, 8, 1)]
+void NormalCompute(uint3 id : SV_DispatchThreadID)
+{
+    const uint index = mad(id.x, colVertexCount, id.y);
+    float3 pos = Positions[index].xyz;
+
+    float3 normal = float3(0, 0, 0);
+    float3 a, b, c;
+    
+    if (id.x < rowVertexCount - 1)
+    {
+        // down
+        c = Positions[index + colVertexCount].xyz - pos;
+        if (id.y < colVertexCount - 1)
+        {
+            // right
+            a = Positions[index + 1].xyz - pos;
+            // down-right
+            b = Positions[index + colVertexCount + 1].xyz - pos;
+            normal += safeNormalize(cross(b, a));
+            normal += safeNormalize(cross(c, b));
+        }
+        if (id.y > 0)
+        {
+            // left
+            a = Positions[index - 1].xyz - pos;
+            normal += safeNormalize(cross(a, c));
+        }
+    }
+
+    if (id.x > 0)
+    {
+        // up
+        c = Positions[index - colVertexCount].xyz - pos;
+        if (id.y > 0)
+        {
+            // left
+            a = Positions[index - 1].xyz - pos;
+            // up-left
+            b = Positions[index - colVertexCount - 1].xyz - pos;
+            normal += safeNormalize(cross(b, a));
+            normal += safeNormalize(cross(c, b));
+        }
+        if (id.y < colVertexCount - 1)
+        {
+            // right
+            a = Positions[index + 1].xyz - pos;
+            normal += safeNormalize(cross(a, c));
+        } 
+    }
+
+    normal = (dot(normal, normal) == 0) ? float3(0, 0, 1) : safeNormalize(normal);
+
+    Normals[index] = float4(normal, 0);
+}

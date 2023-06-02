@@ -1,0 +1,390 @@
+#pragma kernel UpdatePositions
+#pragma kernel ProjectDistanceConstraints
+#pragma kernel ProjectBendingConstraints
+#pragma kernel ProjectFixConstraints
+#pragma kernel ProjectSphereCollisionsConstraints
+
+RWStructuredBuffer<float4> PositionsOut;
+RWStructuredBuffer<float4> PositionsIn;
+
+uint colVertexCount;
+uint rowVertexCount;
+matrix modelMatrix;
+matrix modelMatrixInv;
+float4 gravityAcceleration;
+float damping;
+float dt;
+float gridSize;
+float bendingAngle;
+uint fixedVertexCount;
+float4 leftFixPos;
+float4 rightFixPos;
+
+float sphereRadius;
+float4 sphereCenter;
+
+float3 verlet(float3 p0, float3 p1, float damping, float3 a, float dt)
+{
+    return p1 + damping * (p1 - p0) + a * dt * dt;
+}
+
+// In: Positions0 (Model Space)
+// Out: Positions1 (World Space)
+[numthreads(8, 8, 1)]
+void UpdatePositions(uint3 id : SV_DispatchThreadID)
+{
+    const uint index = mad(id.x, colVertexCount, id.y);
+    float3 a = gravityAcceleration.xyz;
+
+    float3 p2 = verlet(PositionsIn[index].xyz, PositionsOut[index].xyz, damping, a, dt);
+
+    PositionsIn[index] = PositionsOut[index];
+    PositionsOut[index] = float4(p2, 1.0f);
+}
+
+// Return Delta p1
+float3 calculateDistanceConstraints(float3 p1, float3 p2, float restLength)
+{
+    float3 dir = p2 - p1;
+    float len = length(dir);
+    return (len - restLength) * dir / (2 * len);
+}
+
+// return delta pi, i = 1, 2, 3, 4
+float3 calculateBendingConstraints(float3 _p1, float3 _p2, float3 _p3, float3 _p4, int id)
+{
+    float3 p2 = _p2 - _p1;
+    float3 p3 = _p3 - _p1;
+    float3 p4 = _p4 - _p1;
+
+    float3 n1 = normalize(cross(p2, p3));
+    float3 n2 = normalize(cross(p2, p4));
+    float d = dot(n1, n2);
+    
+    float4x3 q = float4x3(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    q[2] = (cross(p2, n2) + cross(n1, p2) * d) / max(length(cross(p2, p3)), 0.0001);
+    q[3] = (cross(p2, n1) + cross(n2, p2) * d) / max(length(cross(p2, p4)), 0.0001);
+    q[1] = -(cross(p3, n2) + cross(n1, p3) * d) / max(length(cross(p2, p3)), 0.0001)
+        -(cross(p4, n1) + cross(n2, p4) * d) / max(length(cross(p2, p4)), 0.0001);
+    q[0] = -(q[1] + q[2] + q[3]);
+
+    float div = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        float mag = length(q[i]);
+        div += mag * mag;
+    }
+
+    float k = -sqrt(max(1.0 - d * d, 0.0001)) * (acos(clamp(d, -1.0, 1.0)) - bendingAngle) / max(div, 0.0001);
+
+    return k * q[id];
+}
+
+// In: Positions1
+// Out: Positions2
+[numthreads(8, 8, 1)]
+void ProjectDistanceConstraints(uint3 id : SV_DispatchThreadID)
+{
+    const uint index = mad(id.x, colVertexCount, id.y);
+    float3 pos = PositionsIn[index].xyz;
+
+    float3 deltaPos = float3(0, 0, 0);
+    float tot = 0.0;
+    
+    // left
+    if (id.y > 0)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index - 1].xyz, gridSize);
+        tot += 1.0;
+    }
+    // down
+    if (id.x < rowVertexCount - 1)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index + colVertexCount].xyz, gridSize);
+        tot += 1.0;
+    }
+    // right
+    if (id.y < colVertexCount - 1)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index + 1].xyz, gridSize);
+        tot += 1.0;
+    }
+    // up
+    if (id.x > 0)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index - colVertexCount].xyz, gridSize);
+        tot += 1.0;
+    }
+    // up-left
+    if (id.x > 0 && id.y > 0)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index - colVertexCount - 1].xyz, sqrt(2) * gridSize);
+        tot += 1.0;
+    }
+    // down-right
+    if (id.x < rowVertexCount - 1 && id.y < colVertexCount - 1)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index + colVertexCount + 1].xyz, sqrt(2) * gridSize);
+        tot += 1.0;
+    }
+    // up-right
+    if (id.x > 0 && id.y < colVertexCount - 1)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index - colVertexCount + 1].xyz, sqrt(2) * gridSize);
+        tot += 1.0;
+    }
+    // down-right
+    if (id.x < rowVertexCount - 1 && id.y > 0)
+    {
+        deltaPos += calculateDistanceConstraints(pos, PositionsIn[index + colVertexCount - 1].xyz, sqrt(2) * gridSize);
+        tot += 1.0;
+    }
+
+    PositionsOut[index] = (tot == 0) ? float4(pos, 1.0) : float4((deltaPos / tot) + pos, 1.0);
+}
+
+// In: Positions2
+// Out: Positions1
+[numthreads(8, 8, 1)]
+void ProjectBendingConstraints(uint3 id : SV_DispatchThreadID)
+{
+    const int index = mad(id.x, colVertexCount, id.y);
+    
+    float3 pos = PositionsIn[index].xyz;    
+    float3 deltaP = float3(0, 0, 0);
+    float tot = 0.0;
+
+    
+    if (id.x > 1 && id.y > 0)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index - colVertexCount - 1].xyz,
+            PositionsIn[index - colVertexCount].xyz,
+            PositionsIn[index - 2 * colVertexCount - 1].xyz,
+            pos,
+            3
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x > 0 && id.x < rowVertexCount - 1 && id.y > 0)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index - 1].xyz,
+            pos,
+            PositionsIn[index - colVertexCount - 1].xyz,
+            PositionsIn[index + colVertexCount].xyz,
+            1
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x > 0 && id.x < rowVertexCount - 1 && id.y < colVertexCount - 1)
+    {
+        float3 ret = calculateBendingConstraints(
+            pos,
+            PositionsIn[index + 1].xyz,
+            PositionsIn[index - colVertexCount].xyz,
+            PositionsIn[index + colVertexCount + 1].xyz,
+            0
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x < rowVertexCount - 2 && id.y < colVertexCount - 1)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + colVertexCount].xyz,
+            PositionsIn[index + colVertexCount + 1].xyz,
+            pos,
+            PositionsIn[index + 2 * colVertexCount + 1].xyz,
+            2
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+
+    
+    if (id.x > 0 && id.x < rowVertexCount - 1 && id.y > 0)
+    {
+        float3 ret = calculateBendingConstraints(
+            pos,
+            PositionsIn[index - 1].xyz,
+            PositionsIn[index - colVertexCount].xyz,
+            PositionsIn[index + colVertexCount - 1].xyz,
+            0
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x < rowVertexCount - 2 && id.y > 0)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + colVertexCount].xyz,
+            PositionsIn[index + colVertexCount - 1].xyz,
+            pos,
+            PositionsIn[index + 2 * colVertexCount - 1].xyz,
+            2
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x > 2 && id.y < colVertexCount - 1)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index - colVertexCount + 1].xyz,
+            PositionsIn[index - colVertexCount].xyz,
+            PositionsIn[index - 2 * colVertexCount + 1].xyz,
+            pos,
+            3
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x > 0 && id.x < rowVertexCount - 1 && id.y < colVertexCount - 1)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + 1].xyz,
+            pos,
+            PositionsIn[index - colVertexCount + 1].xyz,
+            PositionsIn[index + colVertexCount].xyz,
+             1
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+
+    
+    if (id.x > 0 && id.y < colVertexCount - 1 && id.y > 0)
+    {
+        float3 ret = calculateBendingConstraints(
+            pos,
+            PositionsIn[index - colVertexCount].xyz,
+            PositionsIn[index + 1].xyz,
+            PositionsIn[index - colVertexCount - 1].xyz,
+            0
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x < rowVertexCount - 1 && id.y < colVertexCount - 1 && id.y > 0)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + colVertexCount].xyz,
+            pos,
+            PositionsIn[index - 1].xyz,
+            PositionsIn[index + colVertexCount + 1].xyz,
+            1
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x > 0 && id.y > 1)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index - 1].xyz,
+            PositionsIn[index - colVertexCount - 1].xyz,
+            PositionsIn[index - colVertexCount - 2].xyz,
+            pos,
+            3
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x < rowVertexCount - 1 && id.y < colVertexCount - 2)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + colVertexCount + 1].xyz,
+            PositionsIn[index + 1].xyz,
+            pos,
+            PositionsIn[index + colVertexCount + 2].xyz,
+            2
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+
+    
+    if (id.x > 0 && id.y < colVertexCount - 1 && id.y > 0)
+    {
+        float3 ret = calculateBendingConstraints(
+            pos,
+            PositionsIn[index - colVertexCount].xyz,
+            PositionsIn[index - 1].xyz,
+            PositionsIn[index - colVertexCount + 1].xyz,
+            0
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x < rowVertexCount - 1 && id.y > 1)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + colVertexCount - 1].xyz,
+            PositionsIn[index - 1].xyz,
+            PositionsIn[index + colVertexCount - 2].xyz,
+            pos,
+            3
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x < rowVertexCount - 1 && id.y > 0 && id.y < colVertexCount - 1)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + colVertexCount].xyz,
+            pos,
+            PositionsIn[index + colVertexCount - 1].xyz,
+            PositionsIn[index + 1].xyz,
+            1
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+    if (id.x > 0 && id.y < colVertexCount - 2)
+    {
+        float3 ret = calculateBendingConstraints(
+            PositionsIn[index + 1].xyz,
+            PositionsIn[index - colVertexCount + 1].xyz,
+            pos,
+            PositionsIn[index - colVertexCount + 2].xyz,
+            2
+        );
+        deltaP += ret;
+        tot += 1.0;
+    }
+
+    PositionsOut[index] = (tot == 0.0) ? float4(pos, 1.0) : float4((deltaP / tot) + pos, 1.0);
+    //Positions1[index] = float4(pos, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void ProjectFixConstraints(uint3 id : SV_DispatchThreadID)
+{
+    const int index = mad(id.x, colVertexCount, id.y);
+
+    if (index == 0)
+    {
+        PositionsOut[index] = mul(modelMatrix, leftFixPos);
+        return;
+    }
+    if (index == colVertexCount - 1)
+    {
+        PositionsOut[index] = mul(modelMatrix, rightFixPos);
+        return;
+    }
+
+    PositionsOut[index] = PositionsIn[index];
+}
+
+[numthreads(8, 8, 1)]
+void ProjectSphereCollisionsConstraints(uint3 id : SV_DispatchThreadID)
+{
+    const int index = mad(id.x, colVertexCount, id.y);
+
+    float4 pos = PositionsIn[index];
+    if (length(pos - sphereCenter) < sphereRadius)
+    {
+        PositionsOut[index] = sphereCenter + normalize(pos - sphereCenter) * sphereRadius;
+    }
+}

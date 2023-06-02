@@ -1,0 +1,87 @@
+#pragma kernel TangentCompute
+
+StructuredBuffer<float4> Positions;
+StructuredBuffer<float4> Normals;
+StructuredBuffer<float2> TexCoords;
+RWStructuredBuffer<float4> Tangents;
+
+uint colVertexCount;
+uint rowVertexCount;
+
+inline float3 calculateTangent(float3 p0, float3 p1, float3 p2, float2 uv0, float2 uv1, float2 uv2, float3 normal)
+{
+    float3 q1 = p1 - p0;
+    float3 q2 = p2 - p0;
+
+    float div = (uv1.x - uv0.x) * (uv2.y - uv0.y) - (uv1.y - uv0.y) * (uv2.x - uv0.x);
+    float fact = 1.0 / div;
+    float2x2 uvCoeffInv = float2x2(uv2.y - uv0.y, uv0.y - uv1.y, uv0.x - uv2.x, uv1.x - uv0.x);
+    uvCoeffInv *= fact;
+
+    float2x3 qMat = float2x3(q1, q2);
+    float3 T = normalize(mul(uvCoeffInv[0], qMat));
+
+    return normalize(T - dot(T, normal) * normal);
+}
+
+[numthreads(8, 8, 1)]
+void TangentCompute(uint3 id : SV_DispatchThreadID)
+{
+    const uint index = mad(id.x, colVertexCount, id.y);
+    float3 pos = Positions[index].xyz;
+
+    float3 tangent = float3(0, 0, 0);
+
+    // 
+    if (id.x < rowVertexCount - 1 && id.y < colVertexCount - 1)
+    {
+        tangent = calculateTangent(
+            pos,
+            Positions[index + colVertexCount].xyz,
+            Positions[index + colVertexCount + 1].xyz,
+            TexCoords[index],
+            TexCoords[index + colVertexCount],
+            TexCoords[index + colVertexCount + 1],
+            Normals[index].xyz
+        );
+    }
+    else if (id.x < rowVertexCount - 1 && id.y == colVertexCount - 1)
+    {
+        tangent = calculateTangent(
+            pos,
+            Positions[index - 1].xyz,
+            Positions[index + colVertexCount].xyz,
+            TexCoords[index],
+            TexCoords[index - 1],
+            TexCoords[index + colVertexCount],
+            Normals[index].xyz
+        );
+    }
+    else if (id.x == rowVertexCount - 1 && id.y < colVertexCount - 1)
+    {
+        tangent = calculateTangent(
+            pos,
+            Positions[index + 1].xyz,
+            Positions[index - colVertexCount].xyz,
+            TexCoords[index],
+            TexCoords[index + 1],
+            TexCoords[index - colVertexCount],
+            Normals[index].xyz
+        );
+    }
+    else
+    {
+        tangent = calculateTangent(
+            pos,
+            Positions[index - 1].xyz,
+            Positions[index - colVertexCount - 1].xyz,
+            TexCoords[index],
+            TexCoords[index - 1],
+            TexCoords[index - colVertexCount - 1],
+            Normals[index].xyz
+        );
+    }
+
+    tangent = (dot(tangent, tangent) == 0) ? float3(1, 0, 0) : tangent;
+    Tangents[index] = float4(tangent, -1);
+}
